@@ -27,6 +27,9 @@ export async function createActivity(input: unknown) {
 
   const [user, team] = await Promise.all([User.findById(userId), Team.findById(teamId)]);
   if (!user || !team) throw serviceError(400, 'Activity must reference an existing user and team');
+  if (user.team?.toString() !== team._id.toString() || !team.members.some((member) => member.toString() === user._id.toString())) {
+    throw serviceError(400, 'Activity user must belong to the selected team');
+  }
 
   return Activity.create({
     user: user._id,
@@ -51,11 +54,30 @@ export async function createTeam(input: unknown) {
   if (!Array.isArray(members) || members.some((member) => typeof member !== 'string' || !isValidObjectId(member))) {
     throw serviceError(400, 'Team members must be valid user IDs');
   }
-  if (members.length > 0 && await User.countDocuments({ _id: { $in: members } }) !== members.length) {
+  const memberUsers = members.length > 0
+    ? await User.find({ _id: { $in: members } }).select('_id team').lean()
+    : [];
+  if (memberUsers.length !== members.length) {
     throw serviceError(400, 'Team members must reference existing users');
   }
+  if (memberUsers.some((member) => member.team) || (members.length > 0 && await Team.exists({ members: { $in: members } }))) {
+    throw serviceError(400, 'Users may belong to only one team');
+  }
 
-  return Team.create({ name: name.trim(), mascot: mascot.trim(), members });
+  const team = await Team.create({ name: name.trim(), mascot: mascot.trim(), members });
+  if (members.length > 0) {
+    try {
+      const result = await User.updateMany({ _id: { $in: members }, team: null }, { $set: { team: team._id } });
+      if (result.modifiedCount !== members.length) throw serviceError(409, 'A team member was assigned concurrently');
+    } catch (error) {
+      await Promise.all([
+        Team.deleteOne({ _id: team._id }),
+        User.updateMany({ _id: { $in: members }, team: team._id }, { $unset: { team: 1 } }),
+      ]);
+      throw error;
+    }
+  }
+  return team;
 }
 
 export async function getLeaderboard() {
